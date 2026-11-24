@@ -31,7 +31,12 @@ final class SoundShare {
     private var running = false
     private var generation = 0
     private var state = State.off {
-        didSet { if state != oldValue { let s = state; DispatchQueue.main.async { self.onState?(s) } } }
+        didSet {
+            guard state != oldValue else { return }
+            let s = state
+            log.notice("tv \(String(describing: s), privacy: .public)")
+            DispatchQueue.main.async { self.onState?(s) }
+        }
     }
 
     init(host: String, key: String?, deviceName: String) {
