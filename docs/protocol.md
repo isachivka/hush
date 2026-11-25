@@ -37,5 +37,10 @@ back); not needed.
 - Results ThinQ knows: SUCCESS, NOT_AVAILABLE, MAX_CONNECTION, BT_SINK (the TV plays to Bluetooth),
   MINIMAL_APP, MIRACAST_PLAYING. ThinQ refuses at `count >= 3`.
 - The TV now and then drops a websocket right after several quick reconnects; retry after a second.
+- A stream started for an earlier connection (the client quit or restarted, the Mac slept) stays
+  RUNNING: `stopStreamOut` answers `There is no connected…`, and every `startStreamOut` is refused
+  with `a Key is not correct.` or `Device count is already MAX.` (the subscribe reply then carries
+  a `streamOutKey`). Connecting to `<tv>:9000`, reading and hanging up makes the TV drop it; the
+  next start works.
 - One client streams at a time: starting from the Mac stops ThinQ's stream and the other way round.
 - Tested on an OLED65C1RLA (webOS 6, 2021).

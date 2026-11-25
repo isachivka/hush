@@ -166,9 +166,11 @@ final class SoundShare {
             if payload["returnValue"] as? Bool == true && payload["errorText"] == nil {
                 openAudio()
             } else {
+                if Self.isStale(payload) { drainStaleStream() }
                 retry(.refused("The TV refused: \(payload["errorText"] as? String ?? "unknown error")"))
             }
         case ("error", "go"):
+            if Self.isStale(payload) { drainStaleStream() }
             retry(.refused(Self.explain(payload)))
         default:
             break
@@ -186,6 +188,28 @@ final class SoundShare {
         case "MAX_CONNECTION": return "Too many listeners on the TV"
         default: return "The TV refused: \(payload["errorText"] as? String ?? result ?? "unknown error")"
         }
+    }
+
+    /// The TV is still busy with a stream it started for an earlier connection (Hush quit or
+    /// restarted, the Mac slept): it answers every start with these until that stream is read.
+    private static func isStale(_ payload: [String: Any]) -> Bool {
+        let text = payload["errorText"] as? String ?? ""
+        return text.contains("Key is not correct") || text.contains("already MAX")
+    }
+
+    /// Connects to the old stream on :9000 and hangs up: that is what makes the TV let go of it.
+    private func drainStaleStream() {
+        log.notice("tv busy with an old stream: draining it")
+        let c = NWConnection(host: NWEndpoint.Host(host), port: 9000, using: .tcp)
+        c.stateUpdateHandler = { st in
+            switch st {
+            case .ready: c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { _, _, _, _ in c.cancel() }
+            case .failed, .waiting: c.cancel()
+            default: break
+            }
+        }
+        c.start(queue: q)
+        q.asyncAfter(deadline: .now() + 2) { c.cancel() }
     }
 
     private func startStream(_ c: NWConnection, _ key: String) {
