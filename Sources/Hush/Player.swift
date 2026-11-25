@@ -13,6 +13,19 @@ final class Ring {
     private var lock = os_unfair_lock()
     let capacity: Int
     private(set) var jumps = 0
+    private var renders = 0
+
+    /// Frames ever written and render calls ever made: the watchdog compares them over time.
+    var progress: (written: Int, renders: Int) {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        return (w, renders)
+    }
+
+    /// Called once per render cycle, whatever it plays.
+    func rendered() {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        renders += 1
+    }
 
     init(frames: Int) {
         capacity = frames
@@ -77,17 +90,23 @@ final class Player: ObservableObject {
     private var target = 1920
     private var starving = false
     private var pending = Data()  // touched only on the feeding queue
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
+    private var configObserver: NSObjectProtocol?
+    private var pendingRebuild: DispatchWorkItem?
+    // watchdog state, main thread only
+    private var lastProgress = (written: 0, renders: 0)
+    private var stalledTicks = 0
+    private var stallLimit = 3
 
     init() {
         gain = Float(volume)
         target = Int(targetMs / 1000 * sampleRate)
         setupEngine()
-        NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
-                                               queue: .main) { [weak self] _ in self?.restartEngine() }
+        followDefaultOutput()
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.bufferMs = Int(Double(self.ring.count) / sampleRate * 1000)
+            self.watchdog()
         }
         Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -112,6 +131,7 @@ final class Player: ObservableObject {
     private func setupEngine() {
         let fmt = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
         let src = AVAudioSourceNode(format: fmt) { [unowned self] _, _, frameCount, abl -> OSStatus in
+            self.ring.rendered()
             let bufs = UnsafeMutableAudioBufferListPointer(abl)
             let l = bufs[0].mData!.assumingMemoryBound(to: Float.self)
             let r = bufs[1].mData!.assumingMemoryBound(to: Float.self)
@@ -133,6 +153,9 @@ final class Player: ObservableObject {
         }
         engine.attach(src)
         engine.connect(src, to: engine.mainMixerNode, format: fmt)
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in self?.scheduleRebuild("engine configuration changed") }
         startEngine()
     }
 
@@ -142,10 +165,49 @@ final class Player: ObservableObject {
         refreshDevice()
     }
 
-    private func restartEngine() {
+    /// A new AVAudioEngine, not stop/start of the old one: after the output device goes away and
+    /// comes back (AirPods out of range, the TV grabbing AirPlay) the old engine can stay stuck
+    /// with a stale slice size (kAudioUnitErr_TooManyFramesToProcess, 512 > 471) and never call
+    /// the source node again. Only a fresh engine recovers from that.
+    private func rebuildEngine(_ why: String) {
+        log.notice("audio engine rebuilt: \(why, privacy: .public)")
+        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+        configObserver = nil
         engine.stop()
+        engine = AVAudioEngine()
         ring.clear()
-        startEngine()
+        setupEngine()
+        lastProgress = ring.progress
+        stalledTicks = 0
+    }
+
+    /// Device changes come in bursts (and from two sources): rebuild once they settle.
+    private func scheduleRebuild(_ why: String) {
+        pendingRebuild?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.rebuildEngine(why) }
+        pendingRebuild = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    private func followDefaultOutput() {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: 0)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, .main) { [weak self] _, _ in
+            self?.scheduleRebuild("default output device changed")
+        }
+    }
+
+    /// The TV keeps sending but the output stopped asking for audio: the engine is stuck, replace
+    /// it. Backs off (1.5 s, 3 s, 6 s … 48 s) while there is no output that works at all.
+    private func watchdog() {
+        let now = ring.progress
+        defer { lastProgress = now }
+        guard now.renders == lastProgress.renders else { stalledTicks = 0; stallLimit = 3; return }
+        guard now.written != lastProgress.written else { return }  // no sound coming in: nothing to play
+        stalledTicks += 1
+        guard stalledTicks >= stallLimit else { return }
+        rebuildEngine("output stalled for \(Double(stalledTicks) / 2) s while the TV was sending")
+        stallLimit = min(stallLimit * 2, 96)
     }
 
     /// 128-frame (2.7 ms) hardware I/O buffer on the output device instead of the default 512.
